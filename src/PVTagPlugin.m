@@ -1,5 +1,6 @@
 // PVTagPlugin.m
-// Injects Finder-style color-tag support into PictureView's context menus.
+// Injects Finder-style color-tag support into PictureView's context menus,
+// and displays tag color dots next to folder icons in the sidebar and gallery.
 //
 // Hook strategy:
 //   Primary  – swizzle NSView.menuForEvent: (catches menu creation before it's shown)
@@ -77,6 +78,28 @@ static NSArray<NSString *> *currentTags(NSURL *url) {
     return names;
 }
 
+// ─── Tag cache (path → display tag names) ────────────────────────────────────
+// Populated by NSFileManager hook (pre-scans directories) and by toggleTag.
+// Used by drawRow: and drawRect: to paint color dots without re-reading xattr.
+
+static NSMutableDictionary<NSString *, NSArray<NSString *> *> *gTagCache;
+
+// Associated object keys for attaching a file URL to a view
+static const char kURLAssocKey  = 0;   // view → NSURL (its folder URL)
+static const char kURLTriedKey  = 0;   // marker: we already tried to discover URL
+
+// Update the cache entry for a single URL (call after any tag change)
+static void cacheUpdate(NSURL *url) {
+    if (!url.path.length) return;
+    NSArray *tags = currentTags(url);
+    @synchronized(gTagCache) {
+        if (tags.count > 0)
+            gTagCache[url.path] = tags;
+        else
+            [gTagCache removeObjectForKey:url.path];
+    }
+}
+
 static BOOL toggleTag(NSURL *url, NSString *tagName) {
     NSArray *raw = readRawTags(url);
     NSString *storedName = [NSString stringWithFormat:@"%@\n%d", tagName, tagColorIndex(tagName)];
@@ -91,10 +114,79 @@ static BOOL toggleTag(NSURL *url, NSString *tagName) {
     if (!found) [updated addObject:storedName]; // add
 
     BOOL ok = writeRawTags(url, updated);
+    if (ok) cacheUpdate(url); // keep cache in sync
     NSLog(@"[PVTag] toggleTag '%@' %@ ok=%d → stored=%@",
           tagName, found ? @"removed" : @"added", ok,
           [updated componentsJoinedByString:@"|"]);
     return ok;
+}
+
+// ─── Drawing helpers ──────────────────────────────────────────────────────────
+
+// Draw small colored circles (tag dots) starting at 'origin', diameter 'size'.
+// Caller must set up/restore graphics state and NSColor if needed.
+static void pvDrawTagDots(NSArray<NSString *> *tags, NSPoint origin, CGFloat size) {
+    NSArray *colors = tagColors();
+    NSArray *names  = tagNames();
+    CGFloat x = origin.x;
+    for (NSString *tag in tags) {
+        NSUInteger idx = [names indexOfObject:tag];
+        if (idx == NSNotFound) continue;
+        [colors[idx] setFill];
+        [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(x, origin.y, size, size)] fill];
+        x += size + 2.0;
+    }
+}
+
+// Walk view hierarchy to find all NSTableViews and mark them for redraw.
+static void pvMarkTableViewsNeedsDisplay(NSView *view) {
+    if ([view isKindOfClass:[NSTableView class]]) {
+        [view setNeedsDisplay:YES];
+        return;
+    }
+    for (NSView *sub in view.subviews) pvMarkTableViewsNeedsDisplay(sub);
+}
+
+// ─── URL extraction from NSTableView data source ─────────────────────────────
+// Returns the file URL for the model object at 'row' in the table, or nil.
+
+static NSURL *urlFromTableViewRow(NSTableView *tv, NSInteger row) {
+    if (row < 0) return nil;
+
+    NSURL *(^tryURL)(id) = ^NSURL *(id obj) {
+        if (!obj || [obj isKindOfClass:[NSNull class]]) return nil;
+        if ([obj isKindOfClass:[NSURL class]]) return (NSURL *)obj;
+        if ([obj respondsToSelector:@selector(url)]) {
+            id r = ((id(*)(id,SEL))objc_msgSend)(obj, @selector(url));
+            if ([r isKindOfClass:[NSURL class]]) return (NSURL *)r;
+        }
+        if ([obj respondsToSelector:@selector(path)]) {
+            id r = ((id(*)(id,SEL))objc_msgSend)(obj, @selector(path));
+            if ([r isKindOfClass:[NSString class]] && [(NSString *)r length])
+                return [NSURL fileURLWithPath:(NSString *)r];
+        }
+        return nil;
+    };
+
+    for (id src in @[(id)tv.dataSource ?: [NSNull null], (id)tv.delegate ?: [NSNull null]]) {
+        if ([src isKindOfClass:[NSNull class]]) continue;
+        if ([src respondsToSelector:@selector(items)]) {
+            id arr = ((id(*)(id,SEL))objc_msgSend)(src, @selector(items));
+            if ([arr isKindOfClass:[NSArray class]] && row < (NSInteger)[(NSArray *)arr count]) {
+                id obj = [(NSArray *)arr objectAtIndex:row];
+                NSURL *u = tryURL(obj);
+                if (!u && [obj respondsToSelector:@selector(item)])
+                    u = tryURL(((id(*)(id,SEL))objc_msgSend)(obj, @selector(item)));
+                if (u) return u;
+            }
+        }
+        if ([src respondsToSelector:@selector(tableView:objectValueForTableColumn:row:)]) {
+            id obj = [src tableView:tv objectValueForTableColumn:tv.tableColumns.firstObject row:row];
+            NSURL *u = tryURL(obj);
+            if (u) return u;
+        }
+    }
+    return nil;
 }
 
 // ─── Finder-style color-dot row view ─────────────────────────────────────────
@@ -190,6 +282,16 @@ static const CGFloat kHPad  = 14.0;
         NSLog(@"[PVTag] toggling tag '%@' on %@", tagNames()[idx], self.targetURL.path);
         toggleTag(self.targetURL, tagNames()[idx]);
         [self setNeedsDisplay:YES];
+
+        // Trigger redraw of the whole window so sidebar/gallery dots update
+        dispatch_async(dispatch_get_main_queue(), ^{
+            for (NSWindow *win in NSApplication.sharedApplication.windows) {
+                pvMarkTableViewsNeedsDisplay(win.contentView);
+                // Also mark any view that has an associated URL pointing to our path
+                // (covers gallery cards)
+                [win.contentView setNeedsDisplay:YES];
+            }
+        });
     }
 }
 
@@ -385,6 +487,22 @@ static void augmentMenuIfNeeded(NSMenu *menu, NSEvent *event, NSView *sourceView
     [[NSFileManager defaultManager] fileExistsAtPath:url.path isDirectory:&isDir];
     if (!isDir) return;
 
+    // Update cache with current tags for this URL
+    cacheUpdate(url);
+
+    // Associate the URL with the source view so drawRect: can find it for the gallery card
+    if (sourceView) {
+        objc_setAssociatedObject(sourceView, &kURLAssocKey, url, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // Also walk up to find GalleryPictureCard-like views and mark them
+        for (NSView *v = sourceView; v; v = v.superview) {
+            NSString *cls = NSStringFromClass(v.class);
+            if ([cls containsString:@"GalleryPictureCard"] || [cls containsString:@"PictureCard"]) {
+                objc_setAssociatedObject(v, &kURLAssocKey, url, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                break;
+            }
+        }
+    }
+
     // ── Insert tag row ────────────────────────────────────────────────────────
     [menu addItem:[NSMenuItem separatorItem]];
     [menu addItem:makeTagMenuItem(url)];
@@ -446,10 +564,106 @@ static void swiz_rightMouseDown(NSView *self, SEL _cmd, NSEvent *event) {
     orig_rightMouseDown(self, _cmd, event);
 }
 
+// ─── Swizzle 5: NSTableView.drawRow:clipRect: ─────────────────────────────────
+// After drawing each row, overlay tag color dots on the right side.
+
+static void (*orig_drawRow)(NSTableView *, SEL, NSInteger, NSRect) = NULL;
+
+static void swiz_drawRow(NSTableView *self, SEL _cmd, NSInteger row, NSRect clip) {
+    orig_drawRow(self, _cmd, row, clip);
+
+    // Get URL for this row (fast: indexed array access via data source)
+    NSURL *url = urlFromTableViewRow(self, row);
+    if (!url || !url.path.length) return;
+
+    NSArray *tags = nil;
+    @synchronized(gTagCache) { tags = gTagCache[url.path]; }
+    if (!tags || tags.count == 0) return;
+
+    // Draw dots right-aligned inside the row, vertically centered
+    NSRect rowRect  = [self rectOfRow:row];
+    CGFloat dotSize = 8.0;
+    CGFloat spacing = 2.0;
+    CGFloat margin  = 8.0;
+    CGFloat totalW  = tags.count * dotSize + (tags.count - 1) * spacing;
+    NSPoint origin  = NSMakePoint(NSMaxX(rowRect) - totalW - margin,
+                                  NSMinY(rowRect) + (NSHeight(rowRect) - dotSize) / 2.0);
+
+    [NSGraphicsContext saveGraphicsState];
+    pvDrawTagDots(tags, origin, dotSize);
+    [NSGraphicsContext restoreGraphicsState];
+}
+
+// ─── Swizzle 6: NSView.drawRect: ─────────────────────────────────────────────
+// For gallery cards that have an associated URL, draw tag dots in bottom-left corner.
+
+static void (*orig_drawRect)(NSView *, SEL, NSRect) = NULL;
+
+static void swiz_drawRect(NSView *self, SEL _cmd, NSRect rect) {
+    orig_drawRect(self, _cmd, rect);
+
+    // Check for associated URL set during right-click interception
+    id assoc = objc_getAssociatedObject(self, &kURLAssocKey);
+    if (!assoc) return;  // fast path: no URL → nothing to draw
+    if (![assoc isKindOfClass:[NSURL class]]) return;
+    NSURL *url = (NSURL *)assoc;
+
+    NSArray *tags = nil;
+    @synchronized(gTagCache) { tags = gTagCache[url.path]; }
+    if (!tags || tags.count == 0) return;
+
+    // Draw small dots in bottom-left corner of the card view
+    [NSGraphicsContext saveGraphicsState];
+    CGFloat dotSize = 8.0;
+    NSPoint origin  = NSMakePoint(4.0, 4.0);
+    pvDrawTagDots(tags, origin, dotSize);
+    [NSGraphicsContext restoreGraphicsState];
+}
+
+// ─── Swizzle 7: NSFileManager.contentsOfDirectoryAtURL:... ───────────────────
+// Pre-populate gTagCache for every directory listing PictureView requests.
+
+static NSArray *(*orig_contentsOfDir)(NSFileManager *, SEL, NSURL *, NSArray *,
+                                      NSDirectoryEnumerationOptions, NSError **) = NULL;
+
+static NSArray *swiz_contentsOfDir(NSFileManager *self, SEL _cmd, NSURL *url,
+                                   NSArray *keys, NSDirectoryEnumerationOptions opts,
+                                   NSError **err) {
+    NSArray *results = orig_contentsOfDir(self, _cmd, url, keys, opts, err);
+
+    // Background scan: cache tags for all subdirectory results
+    NSArray *snapshot = [results copy];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        BOOL anyTagged = NO;
+        for (NSURL *item in snapshot) {
+            BOOL isDir = NO;
+            if (![[NSFileManager defaultManager] fileExistsAtPath:item.path isDirectory:&isDir]) continue;
+            if (!isDir) continue;
+            NSArray *tags = currentTags(item);
+            if (tags.count > 0) {
+                @synchronized(gTagCache) { gTagCache[item.path] = tags; }
+                anyTagged = YES;
+            }
+        }
+        if (anyTagged) {
+            // Refresh sidebar table views after cache is populated
+            dispatch_async(dispatch_get_main_queue(), ^{
+                for (NSWindow *win in NSApplication.sharedApplication.windows) {
+                    pvMarkTableViewsNeedsDisplay(win.contentView);
+                }
+            });
+        }
+    });
+
+    return results;
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 __attribute__((constructor))
 static void PVTagPlugin_init(void) {
+    gTagCache = [NSMutableDictionary dictionary];
+
     // Self-test: verify xattr tag API works from our dylib
     {
         NSString *testDir = @"/tmp/pvtag_selftest";
@@ -527,4 +741,37 @@ static void PVTagPlugin_init(void) {
             method_setImplementation(m, (IMP)swiz_wsOpenURL);
         }
     }
+
+    // 7. NSTableView.drawRow:clipRect: — draw tag dots in sidebar rows
+    {
+        Method m = class_getInstanceMethod([NSTableView class],
+                       @selector(drawRow:clipRect:));
+        if (m) {
+            orig_drawRow = (void(*)(NSTableView*,SEL,NSInteger,NSRect))method_getImplementation(m);
+            method_setImplementation(m, (IMP)swiz_drawRow);
+        }
+    }
+
+    // 8. NSView.drawRect: — draw tag dots on gallery cards (via associated URL)
+    {
+        Method m = class_getInstanceMethod([NSView class], @selector(drawRect:));
+        if (m) {
+            orig_drawRect = (void(*)(NSView*,SEL,NSRect))method_getImplementation(m);
+            method_setImplementation(m, (IMP)swiz_drawRect);
+        }
+    }
+
+    // 9. NSFileManager.contentsOfDirectoryAtURL: — pre-populate tag cache
+    {
+        Method m = class_getInstanceMethod([NSFileManager class],
+                       @selector(contentsOfDirectoryAtURL:includingPropertiesForKeys:options:error:));
+        if (m) {
+            orig_contentsOfDir = (NSArray*(*)(NSFileManager*,SEL,NSURL*,NSArray*,
+                                              NSDirectoryEnumerationOptions,NSError**))
+                                  method_getImplementation(m);
+            method_setImplementation(m, (IMP)swiz_contentsOfDir);
+        }
+    }
+
+    NSLog(@"[PVTag] loaded — %d hooks installed", 9);
 }
