@@ -54,11 +54,29 @@ PictureView 2.3.4 是一款已停更 4 年的 macOS 闭源图片浏览器（by w
 
 | 功能 | 状态 | 备注 |
 |------|------|------|
-| F1: 右键菜单标签行 | Done | 侧栏 + 主区域均可触发 |
-| F2: Finder 风格样式 | Partial | 已有圆点 + 对勾，颜色待微调至与 Finder 完全一致 |
-| F3: 实际设置标签 | Bug | `setResourceValue` 返回成功但标签未持久化（可能是卷宗兼容性问题） |
-| F4: 读取已有标签 | Partial | 菜单打开时读取 `currentTags(url)`，但未在所有场景验证 |
-| F5: 文件夹图标颜色 | Not Started | 需要 swizzle 图标绘制逻辑 |
+| F1: 右键菜单标签行 | Done | 侧栏 + 画廊均可触发；单选场景 |
+| F2: Finder 风格样式 | Done | 实心圆 + 白色对勾；颜色与 Finder 一致 |
+| F3: 实际设置标签 | Done | 双步写入：NSURLTagNamesKey（触发 Finder 通知）+ setxattr（保留颜色索引）；本地卷 + 挂载卷均验证通过 |
+| F4: 读取已有标签 | Done | 菜单打开时读取 currentTags(url)，正确显示对勾 |
+| F5: 文件夹图标颜色 | Partial | 侧栏：pvRefreshTableTagDots 注入 PVTagDotView 子视图（依赖 gNameToURLCache，仅当 NSFileManager hook 触发后生效）；画廊：drawRect: swizzle + objc associated URL（仅右键后生效） |
+
+## 待实现 / 已知限制
+
+### F5-A: 初始加载时画廊卡片颜色回显
+- **问题**：画廊卡片（GalleryPictureCard）通过 CALayer 渲染，无 NSTextField 子视图，pvTextFromView 取不到文件夹名；drawRect: swizzle 只在右键后有 URL 才生效
+- **方向**：尝试读取 Scanner.directory ivar（ObjC ref，size=8）或监听 GalleryDocument CALayer 刷新
+
+### F5-B: 侧栏初始加载时颜色回显
+- **问题**：pvRefreshTableTagDots 依赖 gNameToURLCache，需 NSFileManager.contentsOfDirectoryAtURL: 先被调用。若 PictureView 用其他 API 列目录（如 POSIX readdir），hook 不触发，cache 为空
+- **方向**：也 hook NSFileManager.contentsOfDirectoryAtPath: 以及 NSURL.resourceValuesForKeys:
+
+### F6: 多选右键标签菜单
+- **问题**：当前右键菜单逻辑只处理单个 URL
+- **需求**：
+  - 多选目录右键时，展示颜色行
+  - 若所有选中目录都有某颜色 → 显示对勾（全选中）
+  - 若部分目录有某颜色 → 显示破折号或半选状态
+  - 点击颜色 → 为所有选中目录批量设置 / 取消标签
 
 ## 技术约束
 
